@@ -1,11 +1,7 @@
 """
-Scraper for IEC agriculture exporters.
-Uses requests + BeautifulSoup to scrape:
-  1. Google Search results
-  2. IndiaMart listings
-  3. TradeIndia listings
-  4. ExportersIndia listings
-No paid API required.
+Scraper using Google Custom Search API (free tier: 100 queries/day).
+Searches for IEC food grain exporters across India and extracts
+contact details from search snippets and result pages.
 """
 
 import re
@@ -13,8 +9,8 @@ import time
 import random
 import hashlib
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 HEADERS = {
     "User-Agent": (
@@ -23,54 +19,17 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 PRODUCT_KEYWORDS = [
     "rice", "wheat", "pulses", "maize", "basmati", "chickpea",
     "lentil", "soybean", "groundnut", "millet", "grain", "cereal",
-    "food grain", "agri"
+    "food grain", "agri", "dal", "paddy", "corn", "oilseed",
 ]
-
-PRODUCT_MAP = {
-    "basmati": "Basmati Rice",
-    "rice": "Non-Basmati Rice",
-    "wheat": "Wheat",
-    "chickpea": "Chickpeas",
-    "lentil": "Lentils",
-    "maize": "Maize",
-    "soybean": "Soybean",
-    "groundnut": "Groundnut",
-    "millet": "Millet",
-    "grain": "Food Grains",
-    "pulse": "Pulses",
-}
-
-
-def _get(url, timeout=10):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.text
-    except Exception:
-        return None
 
 
 def _make_id(name):
     return int(hashlib.md5(name.encode()).hexdigest()[:8], 16)
-
-
-def _score_lead(lead):
-    score = 0
-    if lead.get("phone"):     score += 2
-    if lead.get("email"):     score += 2
-    if lead.get("iec"):       score += 3
-    if lead.get("website"):   score += 1
-    if len(lead.get("countries", [])) >= 3: score += 2
-    if lead.get("shipments"): score += 1
-    if score >= 7:   return "Hot"
-    elif score >= 4: return "Warm"
-    else:            return "Cold"
 
 
 def _extract_products(text):
@@ -78,24 +37,41 @@ def _extract_products(text):
     found = []
     if "basmati" in text_lower:
         found.append("Basmati Rice")
-    elif "rice" in text_lower:
+    elif "rice" in text_lower or "paddy" in text_lower:
         found.append("Non-Basmati Rice")
-    if "wheat" in text_lower:   found.append("Wheat")
-    if "chickpea" in text_lower or "chana" in text_lower: found.append("Chickpeas")
-    if "lentil" in text_lower or "masoor" in text_lower:  found.append("Lentils")
-    if "maize" in text_lower or "corn" in text_lower:     found.append("Maize")
-    if "soybean" in text_lower or "soya" in text_lower:   found.append("Soybean")
+    if "wheat" in text_lower:        found.append("Wheat")
+    if "chickpea" in text_lower or "chana" in text_lower:  found.append("Chickpeas")
+    if "lentil" in text_lower or "masoor" in text_lower or "dal" in text_lower:
+        found.append("Lentils")
+    if "maize" in text_lower or "corn" in text_lower:      found.append("Maize")
+    if "soybean" in text_lower or "soya" in text_lower:    found.append("Soybean")
     if "groundnut" in text_lower or "peanut" in text_lower: found.append("Groundnut")
-    if "millet" in text_lower or "bajra" in text_lower:   found.append("Millet")
-    if "pulse" in text_lower or "dal" in text_lower:      found.append("Pulses")
-    return found or ["Food Grains"]
+    if "millet" in text_lower or "bajra" in text_lower:    found.append("Millet")
+    if "oilseed" in text_lower:      found.append("Oilseeds")
+    if not found and any(k in text_lower for k in ["grain", "cereal", "agri", "export"]):
+        found.append("Food Grains")
+    return list(dict.fromkeys(found)) or ["Food Grains"]
 
 
 def _extract_countries(text, destinations):
     found = []
-    for d in destinations:
-        if d.lower() in text.lower():
-            found.append(d)
+    country_aliases = {
+        "UAE":         ["uae", "dubai", "abu dhabi", "united arab emirates", "sharjah"],
+        "Saudi Arabia":["saudi", "riyadh", "jeddah", "ksa"],
+        "Kuwait":      ["kuwait"],
+        "USA":         ["usa", "united states", "america", "us market"],
+        "Canada":      ["canada", "toronto", "vancouver"],
+        "UK":          ["uk", "united kingdom", "britain", "england", "london"],
+        "Germany":     ["germany", "german", "berlin"],
+        "Netherlands": ["netherlands", "holland", "amsterdam"],
+        "Australia":   ["australia", "sydney", "melbourne"],
+        "China":       ["china", "beijing", "shanghai", "chinese market"],
+    }
+    text_lower = text.lower()
+    for dest in destinations:
+        aliases = country_aliases.get(dest, [dest.lower()])
+        if any(alias in text_lower for alias in aliases):
+            found.append(dest)
     return found
 
 
@@ -103,279 +79,242 @@ def _extract_phone(text):
     patterns = [
         r'\+91[\s\-]?[6-9]\d{9}',
         r'\+91[\s\-]?\d{10}',
-        r'[6-9]\d{9}',
+        r'(?<!\d)[6-9]\d{9}(?!\d)',
         r'\d{4}[\s\-]\d{6}',
-        r'\(\d{3,5}\)[\s\-]?\d{5,8}',
     ]
     for p in patterns:
         m = re.search(p, text)
         if m:
-            return m.group(0).strip()
+            phone = m.group(0).strip()
+            if not phone.startswith("+91"):
+                phone = "+91 " + phone
+            return phone
     return ""
 
 
 def _extract_email(text):
     m = re.search(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', text)
-    return m.group(0) if m else ""
+    if m:
+        email = m.group(0)
+        if not any(x in email.lower() for x in ["example", "test@", "noreply"]):
+            return email
+    return ""
 
 
 def _extract_iec(text):
-    # IEC is a 10-digit number, often prefixed with IEC
-    m = re.search(r'(?:IEC[:\s#]*)?(\d{10})', text, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-# ── Google Scraper ─────────────────────────────────────────────────────────────
-def scrape_google(keyword, destinations, max_results):
-    leads = []
-    dest_str = " ".join(destinations[:3])
-    queries = [
-        f'"{keyword}" IEC exporter India site:indiamart.com',
-        f'"{keyword}" exporter India IEC number {dest_str}',
-        f'site:exportersindia.com "{keyword}" exporter',
-        f'site:tradeindia.com "{keyword}" exporter India',
+    patterns = [
+        r'IEC[:\s#]*(\d{10})',
+        r'IEC[:\s#]*(\d{4}\s\d{6})',
+        r'\bIEC\b[^\d]*(\d{10})',
     ]
-
-    for query in queries[:2]:
-        url = f"https://www.google.com/search?q={requests.utils.quote(query)}&num=15"
-        html = _get(url)
-        if not html:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-        results = soup.select("div.g")
-
-        for r in results[:max_results]:
-            title_el = r.select_one("h3")
-            link_el  = r.select_one("a")
-            snippet_el = r.select_one("div.VwiC3b, span.aCOpRe")
-            if not title_el:
-                continue
-
-            title   = title_el.get_text()
-            snippet = snippet_el.get_text() if snippet_el else ""
-            link    = link_el["href"] if link_el and link_el.get("href","").startswith("http") else ""
-            full_text = title + " " + snippet
-
-            if not any(kw in full_text.lower() for kw in PRODUCT_KEYWORDS):
-                continue
-
-            lead = {
-                "id": _make_id(title),
-                "name": title.split("|")[0].split("-")[0].strip()[:80],
-                "iec": _extract_iec(full_text),
-                "city": "",
-                "phone": _extract_phone(full_text),
-                "email": _extract_email(full_text),
-                "website": link,
-                "countries": _extract_countries(full_text, destinations),
-                "products": _extract_products(full_text),
-                "shipments": "",
-                "score": "Warm",
-                "status": "New",
-                "notes": "",
-                "source": link,
-                "added": datetime.now().strftime("%Y-%m-%d"),
-            }
-            lead["score"] = _score_lead(lead)
-            if lead["name"] and len(lead["name"]) > 4:
-                leads.append(lead)
-
-        time.sleep(random.uniform(1.5, 3.0))
-
-    return leads
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return re.sub(r'\s', '', m.group(1))
+    return ""
 
 
-# ── IndiaMart Scraper ──────────────────────────────────────────────────────────
-def scrape_indiamart(keyword, destinations, max_results):
-    leads = []
-    slug = keyword.lower().replace(" ", "-")
-    urls = [
-        f"https://dir.indiamart.com/search.mp?ss={requests.utils.quote(keyword)}&priceRange=0-0&cat=Grains%2C+Cereals+%26+Flour",
-        f"https://dir.indiamart.com/impcat/{slug}-exporters.html",
+def _extract_city(text):
+    cities = [
+        "Mumbai", "Delhi", "Bangalore", "Hyderabad", "Chennai", "Kolkata",
+        "Ludhiana", "Amritsar", "Jalandhar", "Karnal", "Hisar", "Rohtak",
+        "Indore", "Bhopal", "Nagpur", "Pune", "Surat", "Ahmedabad", "Rajkot",
+        "Jaipur", "Jodhpur", "Kanpur", "Lucknow", "Varanasi", "Agra",
+        "Patna", "Ranchi", "Bhubaneswar", "Visakhapatnam", "Guntur",
+        "Vijayawada", "Coimbatore", "Madurai", "Kochi", "Chandigarh",
     ]
-
-    for url in urls[:1]:
-        html = _get(url)
-        if not html:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-
-        # IndiaMart company listing cards
-        cards = soup.select("div.organic-card, div.companydetails, div.prdcard")
-        if not cards:
-            cards = soup.select("div[class*='company'], div[class*='supplier']")
-
-        for card in cards[:max_results]:
-            text = card.get_text(" ", strip=True)
-            name_el = card.select_one("h2, h3, .company-name, .lcname")
-            name = name_el.get_text(strip=True) if name_el else ""
-            if not name or len(name) < 5:
-                continue
-
-            city_el = card.select_one(".lcadr, .city, [class*='address']")
-            city = city_el.get_text(strip=True) if city_el else ""
-
-            link_el = card.select_one("a[href*='indiamart.com']")
-            link = link_el["href"] if link_el else ""
-
-            phone = _extract_phone(text)
-            email = _extract_email(text)
-
-            lead = {
-                "id": _make_id(name),
-                "name": name[:80],
-                "iec": _extract_iec(text),
-                "city": city,
-                "phone": phone,
-                "email": email,
-                "website": link,
-                "countries": _extract_countries(text, destinations),
-                "products": _extract_products(keyword + " " + text),
-                "shipments": "",
-                "score": "Warm",
-                "status": "New",
-                "notes": "",
-                "source": link or url,
-                "added": datetime.now().strftime("%Y-%m-%d"),
-            }
-            lead["score"] = _score_lead(lead)
-            leads.append(lead)
-
-        time.sleep(random.uniform(1.0, 2.5))
-
-    return leads
+    states = {
+        "Punjab": "Punjab", "Haryana": "Haryana",
+        "Uttar Pradesh": "Uttar Pradesh", "UP": "Uttar Pradesh",
+        "Madhya Pradesh": "Madhya Pradesh", "MP": "Madhya Pradesh",
+        "Gujarat": "Gujarat", "Rajasthan": "Rajasthan",
+        "Maharashtra": "Maharashtra", "Tamil Nadu": "Tamil Nadu",
+        "Karnataka": "Karnataka", "Telangana": "Telangana",
+        "Andhra Pradesh": "Andhra Pradesh", "West Bengal": "West Bengal",
+        "Bihar": "Bihar", "Odisha": "Odisha", "Kerala": "Kerala",
+    }
+    for city in cities:
+        if city.lower() in text.lower():
+            for state_key, state_val in states.items():
+                if state_key.lower() in text.lower():
+                    return f"{city}, {state_val}"
+            return city
+    for state_key, state_val in states.items():
+        if state_key.lower() in text.lower():
+            return state_val
+    return ""
 
 
-# ── ExportersIndia Scraper ─────────────────────────────────────────────────────
-def scrape_exportersindia(keyword, destinations, max_results):
-    leads = []
-    slug  = keyword.lower().replace(" ", "-")
-    url   = f"https://www.exportersindia.com/search/{slug}-exporter.htm"
-    html  = _get(url)
-    if not html:
-        return leads
+def _score_lead(lead):
+    score = 0
+    if lead.get("phone"):                    score += 2
+    if lead.get("email"):                    score += 2
+    if lead.get("iec"):                      score += 3
+    if lead.get("website"):                  score += 1
+    if len(lead.get("countries", [])) >= 2:  score += 2
+    if len(lead.get("products", [])) >= 2:   score += 1
+    name_lower = lead.get("name", "").lower()
+    if "pvt" in name_lower or "ltd" in name_lower or "llp" in name_lower:
+        score += 1
+    if score >= 7:   return "Hot"
+    elif score >= 4: return "Warm"
+    else:            return "Cold"
 
-    soup  = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.sup_listing, div.comp-listing, li.list-item")
 
-    for card in cards[:max_results]:
-        text = card.get_text(" ", strip=True)
-        name_el = card.select_one("h2, h3, strong, .comp-name")
-        name = name_el.get_text(strip=True) if name_el else ""
-        if not name or len(name) < 5:
-            continue
-
-        city_el = card.select_one(".city, .location, [class*='addr']")
-        city = city_el.get_text(strip=True) if city_el else ""
-
-        link_el = card.select_one("a")
-        link = link_el["href"] if link_el and link_el.get("href","").startswith("http") else ""
-
-        lead = {
-            "id": _make_id(name),
-            "name": name[:80],
-            "iec": _extract_iec(text),
-            "city": city,
+def _fetch_page_details(url):
+    """Fetch extra contact details from the lead's own website."""
+    if not url or len(url) > 200:
+        return {}
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        if r.status_code != 200:
+            return {}
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)[:3000]
+        return {
             "phone": _extract_phone(text),
             "email": _extract_email(text),
-            "website": link,
-            "countries": _extract_countries(text, destinations),
-            "products": _extract_products(keyword + " " + text),
-            "shipments": "",
-            "score": "Warm",
-            "status": "New",
-            "notes": "",
-            "source": link or url,
-            "added": datetime.now().strftime("%Y-%m-%d"),
+            "iec":   _extract_iec(text),
+            "city":  _extract_city(text),
         }
-        lead["score"] = _score_lead(lead)
-        leads.append(lead)
-
-    time.sleep(random.uniform(1.0, 2.0))
-    return leads
+    except Exception:
+        return {}
 
 
-# ── TradeIndia Scraper ─────────────────────────────────────────────────────────
-def scrape_tradeindia(keyword, destinations, max_results):
-    leads = []
-    slug  = keyword.lower().replace(" ", "+")
-    url   = f"https://www.tradeindia.com/Exporters/{slug.replace('+','-')}.html"
-    html  = _get(url)
-    if not html:
-        return leads
-
-    soup  = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.company-info, div.product-listing, li.companyList")
-
-    for card in cards[:max_results]:
-        text    = card.get_text(" ", strip=True)
-        name_el = card.select_one("h2, h3, .comp-name, strong")
-        name    = name_el.get_text(strip=True) if name_el else ""
-        if not name or len(name) < 5:
-            continue
-
-        city_el = card.select_one(".city, .location")
-        city    = city_el.get_text(strip=True) if city_el else ""
-
-        link_el = card.select_one("a[href*='tradeindia']")
-        link    = link_el["href"] if link_el and link_el.get("href","").startswith("http") else ""
-
-        lead = {
-            "id": _make_id(name),
-            "name": name[:80],
-            "iec": _extract_iec(text),
-            "city": city,
-            "phone": _extract_phone(text),
-            "email": _extract_email(text),
-            "website": link,
-            "countries": _extract_countries(text, destinations),
-            "products": _extract_products(keyword + " " + text),
-            "shipments": "",
-            "score": "Warm",
-            "status": "New",
-            "notes": "",
-            "source": link or url,
-            "added": datetime.now().strftime("%Y-%m-%d"),
-        }
-        lead["score"] = _score_lead(lead)
-        leads.append(lead)
-
-    time.sleep(random.uniform(1.0, 2.0))
-    return leads
+def google_custom_search(query, api_key, cx, num=10):
+    """Call Google Custom Search API."""
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": api_key, "cx": cx, "q": query, "num": min(num, 10)}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if "error" in data:
+            raise ValueError(f"Google API error: {data['error'].get('message','Unknown')}")
+        return data.get("items", [])
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Request failed: {str(e)}")
 
 
-# ── Master scrape function ─────────────────────────────────────────────────────
-def scrape_leads(keywords, destinations, max_per_source, progress=None):
-    all_leads = []
-    sources = [
-        ("IndiaMart",       scrape_indiamart),
-        ("ExportersIndia",  scrape_exportersindia),
-        ("TradeIndia",      scrape_tradeindia),
-        ("Google",          scrape_google),
-    ]
-    total_steps = len(keywords) * len(sources)
-    step = 0
-
+def build_search_queries(keywords, destinations):
+    """Build targeted search queries for IEC agriculture exporters."""
+    queries = []
+    dest_str = " OR ".join(destinations[:4]) if destinations else "export"
     for kw in keywords:
-        for source_name, fn in sources:
-            step += 1
-            pct  = step / total_steps
-            if progress:
-                progress.progress(pct, text=f"Scraping {source_name} for '{kw}'...")
-            try:
-                results = fn(kw, destinations, max_per_source)
-                all_leads.extend(results)
-            except Exception as e:
-                pass  # silently skip failed sources
-            time.sleep(random.uniform(0.5, 1.5))
+        queries += [
+            f'"{kw}" IEC number India exporter contact email',
+            f'"{kw}" exporter India {dest_str} contact phone',
+            f'site:indiamart.com "{kw}" exporter',
+            f'site:exportersindia.com "{kw}" exporter India',
+            f'site:tradeindia.com "{kw}" exporter',
+            f'"{kw}" exporter India IEC "pvt ltd" contact',
+        ]
+    seen, unique = set(), []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            unique.append(q)
+    return unique
 
-    # Deduplicate within this batch
-    seen_names = set()
-    unique = []
+
+def parse_result_to_lead(item, destinations):
+    """Convert a Google search result into a lead dict."""
+    title   = item.get("title", "")
+    snippet = item.get("snippet", "")
+    link    = item.get("link", "")
+    full_text = f"{title} {snippet}"
+
+    # Clean company name from title
+    name = title
+    for sep in ["|", "-", "–", ":", "·", "—"]:
+        name = name.split(sep)[0].strip()
+    name = re.sub(r'\s+', ' ', name).strip()[:80]
+
+    if not name or len(name) < 5:
+        return None
+    if not any(kw in full_text.lower() for kw in PRODUCT_KEYWORDS):
+        return None
+    exporter_signals = ["export", "pvt", "ltd", "llp", "trading", "agro",
+                        "foods", "grains", "international", "enterprises", "impex"]
+    if not any(sig in full_text.lower() for sig in exporter_signals):
+        return None
+
+    lead = {
+        "id":        _make_id(name + link),
+        "name":      name,
+        "iec":       _extract_iec(full_text),
+        "city":      _extract_city(full_text),
+        "phone":     _extract_phone(full_text),
+        "email":     _extract_email(full_text),
+        "website":   link,
+        "countries": _extract_countries(full_text, destinations),
+        "products":  _extract_products(full_text),
+        "shipments": "",
+        "score":     "Warm",
+        "status":    "New",
+        "notes":     f"Source snippet: {snippet[:150]}",
+        "source":    link,
+        "added":     datetime.now().strftime("%Y-%m-%d"),
+    }
+    lead["score"] = _score_lead(lead)
+    return lead
+
+
+def scrape_leads(keywords, destinations, max_per_source, progress=None,
+                 api_key="", cx=""):
+    """Main entry point — uses Google Custom Search API."""
+    if not api_key or not cx:
+        raise ValueError("Missing API credentials. Add your Google API Key and Search Engine ID in the sidebar.")
+
+    queries = build_search_queries(keywords, destinations)
+    max_queries = min(len(queries), max(4, max_per_source // 2))
+    queries = queries[:max_queries]
+
+    all_leads = []
+
+    for i, query in enumerate(queries):
+        if progress:
+            progress.progress((i + 1) / (len(queries) + 1),
+                              text=f"Searching Google: {query[:55]}...")
+        try:
+            items = google_custom_search(query, api_key, cx, num=10)
+            for item in items:
+                lead = parse_result_to_lead(item, destinations)
+                if lead:
+                    # Enrich from actual website if it's not a directory
+                    url = lead.get("website", "")
+                    skip_fetch = any(d in url for d in [
+                        "indiamart.com", "tradeindia.com",
+                        "exportersindia.com", "justdial.com",
+                        "google.com", "youtube.com",
+                    ])
+                    if url and not skip_fetch:
+                        details = _fetch_page_details(url)
+                        if details.get("phone") and not lead["phone"]:
+                            lead["phone"] = details["phone"]
+                        if details.get("email") and not lead["email"]:
+                            lead["email"] = details["email"]
+                        if details.get("iec") and not lead["iec"]:
+                            lead["iec"] = details["iec"]
+                        if details.get("city") and not lead["city"]:
+                            lead["city"] = details["city"]
+                        lead["score"] = _score_lead(lead)
+                    all_leads.append(lead)
+        except ValueError:
+            raise
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.3, 0.8))
+
+    if progress:
+        progress.progress(1.0, text="Done!")
+
+    # Deduplicate by name
+    seen_names, unique = set(), []
     for l in all_leads:
         key = l["name"].lower().strip()
         if key not in seen_names and len(key) > 4:
             seen_names.add(key)
             unique.append(l)
-
     return unique
